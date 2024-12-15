@@ -102,4 +102,248 @@ Hello shnek
 Neet, it works. Let's make it do something a bit more useful.
 
 
+# Doing stuff
 
+Placeholder for a syslog server
+
+Turning `main.py` into 
+```python
+from asyncio import StreamReader, StreamWriter, start_server, run
+
+PORT = 8888
+
+
+def main():
+    run(run_server())
+
+
+def parse(data: bytes):
+    print(data.decode())
+
+
+async def handler(reader: StreamReader, writer: StreamWriter):
+    addr = writer.get_extra_info("peername")
+    print(f"Got connection from {addr}")
+    while data := await reader.readuntil(b"\n"):
+        parse(data[:-1])
+
+
+async def run_server():
+    server = await start_server(handler, "127.0.0.1", PORT)
+
+    print(f"Running server on {PORT}")
+
+    async with server:
+        await server.serve_forever()
+
+```
+Let's check if it works. Running it with `python -m shnek` and you can send some data to it
+```off
+Running server on 8888
+Got connection from ('127.0.0.1', 49898)
+<34>1 2024-12-15T20:57:00.217+09:00 mantoshkin-pc spamlog 12095 0 - hello from rust!
+<34>1 2024-12-15T20:57:00.217+09:00 mantoshkin-pc spamlog 12095 1 - hello from rust!
+<34>1 2024-12-15T20:57:01.217+09:00 mantoshkin-pc spamlog 12095 2 - hello from rust!
+<34>1 2024-12-15T20:57:02.217+09:00 mantoshkin-pc spamlog 12095 3 - hello from rust!
+<34>1 2024-12-15T20:57:03.217+09:00 mantoshkin-pc spamlog 12095 4 - hello from rust!
+```
+Nice, it works. Though it does not handle any errors when peer disconnects on partial write, but we are not
+writing production code here, so its fine for the experiments.
+
+Now when we have a server lets make it do work.
+
+## Syslog parsing
+
+__intro into syslog and how no-one is following RFC 3164__
+
+So for the sake of the experiment (and my sanity) lets go with RFC 5424. Gladly there is a package available for parsing syslog 5424 aptly named `syslog-rfc5424-parser`. Let's add it to our project
+```sh
+uv add syslog-rfc5424-parser
+```
+
+And actually start parsing the incoming messages:
+```python
+from syslog_rfc5424_parser import SyslogMessage, ParseError
+
+def parse(data: bytes):
+    msg = SyslogMessage.parse(data.decode())
+    print(msg.as_dict())
+```
+Running a server we get a dictionary representation of the syslog message
+```
+Running server on 8888
+Got connection from ('127.0.0.1', 47972)                                                                                {'severity': 'crit', 'facility': 'auth', 'version': 1, 'timestamp': '2024-12-15T21:08:09.484+09:00', 'hostname': 'mantoshkin-pc', 'appname': 'spamlog', 'procid': 18895, 'msgid': '0', 'sd': {}, 'msg': 'hello from rust!'}
+```
+## Simulating integration with rest of the system
+
+Syslog server by it self is not very interesting. For the sake of the experiment we'll simulate integration
+with the rest of the system by sending the parsed messages to a message broker. 
+
+For the message broker lets use NATS
+
+To work with nats we need a few more dependencies, namely `nats-py` and `orjson`
+
+```
+uv add nats-py orjson
+```
+
+To make it work though we'll need to refactor our code a bit. Since handler function needs access to an
+instance of nats `Client` class and it is returned by the async call to `start_server` (hello async python!) we'll have to be a bit clever. One option is to make everything a class that holds a `Client` as an attribute. The other one is to make handler function a clousure so it can capture the `Client`. 
+Let's opt in for a class solution, just because it's a bit easier to reason about. After all the refactoring our `main.py` looks something like this
+
+```python
+from asyncio import StreamReader, StreamWriter, start_server, run
+from syslog_rfc5424_parser import SyslogMessage
+import nats
+from orjson import dumps
+
+PORT = 8888
+
+
+def main():
+    server = Server()
+    run(server.serve())
+
+
+class Server:
+    def __init__(self) -> None:
+        self.nc = None
+        self.server = None
+
+    async def serve(self):
+        self.server = await start_server(self.handler, "127.0.0.1", PORT)
+        self.nc = await nats.connect("nats://localhost:4222")
+
+        print(f"Running server on {PORT}")
+
+        async with self.server:
+            await self.server.serve_forever()
+
+    async def handler(self, reader: StreamReader, writer: StreamWriter):
+        addr = writer.get_extra_info("peername")
+        print(f"Got connection from {addr}")
+        while data := await reader.readuntil(b"\n"):
+            msg = SyslogMessage.parse(data.decode())
+            await self.nc.publish("foo", dumps(msg.as_dict()))
+
+```
+
+Now running server and hitting it with some load we can see the message throughput in `nats-top`. Emulation
+of integration and benchmarking in one go, neet. Let's take this chance to benchmark this solution. 
+```
+NATS server version 2.10.20 (uptime: 27m50s)
+Server:
+  ID:   NDK5QJWY674R2LJFNOAE7RMGCBDVMK5YXIDWHQA3WLQKGFR6UEPJCND5
+  Load: CPU:  0.0%  Memory: 17.7M  Slow Consumers: 0
+  In:   Msgs: 1.2M  Bytes: 226.5M  Msgs/Sec: 16390.2  Bytes/Sec: 3.2M
+  Out:  Msgs: 0  Bytes: 0  Msgs/Sec: 0.0  Bytes/Sec: 0
+
+Connections Polled: 1
+  HOST             CID    SUBS    PENDING     MSGS_TO     MSGS_FROM   BYTES_TO
+  ::1:40536        6      0       0           0           1.2M        0
+```
+With full throttle spamming of messages we get somewhere around 16k msgs/sec. This is going our baseline for later. Btw, don't look to hard into absolute values, it's python, it's running in a single thread,
+so we going to be looking for a rough compresence. Every % of CPU usage won allows other stuff to run in it's place. 
+
+## Moving stuff to rust
+Before we start optimizing anything let's first check <> the solution. For this we going to utilize `py-spy`
+
+```sh
+uv tool install py-spy
+```
+
+```sh
+py-spy record -p 42275 -o shnek.svg
+```
+
+This gives us pretty flamegraph to look at
+
+![](shnek.svg "Flamegraph")
+
+As expected the bulk of the work is parsing the message. So lets do the parsing on the Rust side!
+
+Luckily for us the package we are using for parsing messages also available in rust as `syslog_rfc5424`.
+```
+cargo add syslog_rfc5424 --features serde-serialize
+```
+Featrue to serialize syslog message to json
+
+Now lets implement the parsing on the rust side
+
+```
+use pyo3::prelude::*;
+use syslog_rfc5424::parse_message;
+use serde_json;
+
+#[pyfunction]
+fn parse(data: String) -> PyResult<String> {
+    let msg = parse_message(data).unwrap();
+    return Ok(serde_json::to_string(&msg).expect("Should encode to JSON"));
+}
+
+#[pymodule]
+fn shnek_lib(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(parse, m)?)?;
+    Ok(())
+}
+
+```
+And not to forget to update the typing information
+
+```
+def parse(data: str) -> str: ...
+```
+
+On the python side the changes are minimal
+```
+from asyncio import StreamReader, StreamWriter, start_server, run
+import nats
+from shnek_lib.shnek_lib import parse
+
+PORT = 8888
+
+
+def main():
+    server = Server()
+    run(server.serve())
+
+
+class Server:
+    def __init__(self) -> None:
+        self.nc = None
+        self.server = None
+
+    async def serve(self):
+        self.server = await start_server(self.handler, "127.0.0.1", PORT)
+        self.nc = await nats.connect("nats://localhost:4222")
+
+        print(f"Running server on {PORT}")
+
+        async with self.server:
+            await self.server.serve_forever()
+
+    async def handler(self, reader: StreamReader, writer: StreamWriter):
+        addr = writer.get_extra_info("peername")
+        print(f"Got connection from {addr}")
+        while data := await reader.readuntil(b"\n"):
+            msg = parse(data.decode())
+            await self.nc.publish("foo", msg.encode())
+
+```
+
+Now let's take a look at the speed
+
+```
+NATS server version 2.10.20 (uptime: 58m58s)
+Server:
+  ID:   NDK5QJWY674R2LJFNOAE7RMGCBDVMK5YXIDWHQA3WLQKGFR6UEPJCND5
+  Load: CPU:  0.0%  Memory: 18.4M  Slow Consumers: 0
+  In:   Msgs: 3.0M  Bytes: 593.6M  Msgs/Sec: 65482.9  Bytes/Sec: 13.3M
+  Out:  Msgs: 0  Bytes: 0  Msgs/Sec: 0.0  Bytes/Sec: 0
+
+Connections Polled: 1
+  HOST             CID    SUBS    PENDING     MSGS_TO     MSGS_FROM   BYTES_TO
+  ::1:45846        9      0       0           0           756.3K      0
+```
+
+God damn, it's almost 5 times

@@ -265,6 +265,7 @@ As expected the bulk of the work is parsing the message. So lets do the parsing 
 Luckily for us the package we are using for parsing messages also available in rust as `syslog_rfc5424`.
 ```
 cargo add syslog_rfc5424 --features serde-serialize
+cargo add serde_json
 ```
 Featrue to serialize syslog message to json
 

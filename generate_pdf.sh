@@ -1,1 +1,0 @@
-sed -e '1,5d' content/resume.md -e 's/You can find links.*//g' -e 's/\[\(.*\)\]\((.*)\)/\1/g' | pandoc -f markdown -t html -o static/resume/resume.pdf
